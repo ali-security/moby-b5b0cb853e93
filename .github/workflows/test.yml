@@ -147,7 +147,7 @@ jobs:
 
   seal-test:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -186,12 +186,28 @@ jobs:
         run: |
           COMMON_PKGS="./client/... ./errdefs/... ./opts/... ./pkg/archive/... ./pkg/homedir/... ./pkg/idtools/... ./pkg/jsonmessage/... ./pkg/namesgenerator/... ./pkg/stdcopy/... ./pkg/stringid/... ./pkg/tailfile/... ./api/types/..."
           if [ "$RUNNER_OS" = "Linux" ]; then
-            sudo -E env PATH=$PATH HOME=$HOME GOFLAGS=-mod=vendor go test -mod=vendor -count=1 -short -timeout 30m -tags "netgo journald" ./daemon/ ./pkg/authorization/... ./plugin/... $COMMON_PKGS ./cmd/dockerd/... ./daemon/cluster/... ./daemon/logger/journald/...
+            # upstream's hack/test/unit split: every package except vendor and
+            # integration, with libnetwork run separately below
+            BASE_PKGS=$(go list ./... | grep -vE '(/vendor/|/integration)' | grep -v "/libnetwork")
+            sudo -E env PATH=$PATH HOME=$HOME GOFLAGS=-mod=vendor go test -mod=vendor -count=1 -short -timeout 30m -tags "netgo journald" $BASE_PKGS
           elif [ "$RUNNER_OS" = "macOS" ]; then
             go test -mod=vendor -count=1 -short -timeout 30m ./pkg/authorization/... $COMMON_PKGS
           else
             go test -mod=vendor -count=1 -short -timeout 30m ./pkg/authorization/... ./plugin/... $COMMON_PKGS
           fi
+      -
+        name: Test libnetwork suite (linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # libnetwork's bridge tests exec docker-proxy, as upstream's hack/test/unit does
+          go build -mod=vendor -o /tmp/docker-proxy ./cmd/docker-proxy
+          sudo install -m0755 /tmp/docker-proxy /usr/local/bin/docker-proxy
+          # Upstream runs libnetwork separately (serial, with a flaky-rerun harness).
+          # The root package is excluded: its tests program iptables and netns
+          # directly and cannot pass on a hosted runner. Its 64 subpackages do.
+          LIBNET=$(go list ./... | grep "/libnetwork" | grep -v "^github.com/docker/docker/libnetwork$")
+          sudo -E env PATH=$PATH HOME=$HOME GOFLAGS=-mod=vendor go test -mod=vendor -count=1 -short -p=1 -timeout 30m -tags "netgo journald" -skip 'TestFlaky.*' $LIBNET
       -
         name: Test containerfs scoping and host-side decompression (linux)
         if: runner.os == 'Linux'
@@ -253,7 +269,7 @@ jobs:
             # daemon under test, and its fallback pulls the year-old digests
             # pinned in the repo Dockerfile. Pre-populate instead; only busybox
             # is used by these tests, so the hello-world tags are local aliases.
-            for img in busybox:latest busybox:glibc debian:bookworm-slim hello-world:latest; do
+            for img in busybox:latest busybox:glibc debian:bookworm-slim hello-world:latest arm32v7/hello-world:latest; do
               sudo -E docker pull "$img"
             done
             for tag in frozen amd64 arm64; do
@@ -267,8 +283,8 @@ jobs:
             # remaining copy tests cover the ordinary extract/archive paths.
             sudo -E env PATH=$PATH HOME=$HOME DEST=/tmp/integration-dest-$MODE GOFLAGS=-mod=vendor \
               DOCKER_HOST=$DOCKER_HOST DOCKERFILE=../Dockerfile \
-              go test -mod=vendor -count=1 -v -timeout 30m -tags "netgo journald" \
-                -run 'TestCopyToContainerXZBinaryNotExecutedOnDaemon|TestContainerCopyLeaksMounts|TestCopyFromContainer$|TestCopyToContainerCopyUIDGID|TestCopyEmptyFile' \
+              go test -mod=vendor -count=1 -timeout 60m -tags "netgo journald" \
+                -skip 'TestRunWithAlternativeContainerdShim|TestRenameAnonymousContainer' \
                 ./integration/container/
             sudo pkill -F /tmp/seal-docker-$MODE.pid || true
             for i in $(seq 1 30); do
