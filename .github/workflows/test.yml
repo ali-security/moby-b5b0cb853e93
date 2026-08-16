@@ -269,9 +269,13 @@ jobs:
             # daemon under test, and its fallback pulls the year-old digests
             # pinned in the repo Dockerfile. Pre-populate instead; only busybox
             # is used by these tests, so the hello-world tags are local aliases.
-            for img in busybox:latest busybox:glibc debian:bookworm-slim hello-world:latest arm32v7/hello-world:latest; do
+            for img in busybox:latest busybox:glibc debian:bookworm-slim hello-world:latest; do
               sudo -E docker pull "$img"
             done
+            # TestCreatePlatformSpecificImageNoPlatform needs this one, and it is published
+            # for arm/v7 only, so the platform has to be explicit or the pull resolves to
+            # the host platform and fails.
+            sudo -E docker pull --platform linux/arm/v7 arm32v7/hello-world:latest
             for tag in frozen amd64 arm64; do
               sudo -E docker tag hello-world:latest "hello-world:$tag"
             done
