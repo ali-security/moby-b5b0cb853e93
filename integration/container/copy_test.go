@@ -435,3 +435,57 @@ RUN chmod +x /usr/bin/xz`),
 			"container's xz binary was executed in the daemon's process context: marker file contains the daemon's secret env var")
 	})
 }
+
+// TestCopyToContainerWithAbsoluteSymlinkedMountPath is an end-to-end guard for
+// the over-rejection upstream shipped with its first os.Root-based fix for
+// GHSA-vp62-88p7-qqf5 (moby/moby#52653): a mount whose destination resolves
+// through an *absolute* in-container symlink must still be set up when the
+// daemon opens the container filesystem, which is what docker cp does.
+// Debian-derived images ship /var/run -> /run, which is the shape that broke;
+// busybox has none, so no other copy test in this package reaches this case.
+func TestCopyToContainerWithAbsoluteSymlinkedMountPath(t *testing.T) {
+	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
+
+	cID := container.Run(ctx, t, apiClient,
+		container.WithImage("debian:bookworm-slim"),
+		container.WithCmd("sleep", "60"),
+		container.WithVolume("/var/run/seal-probe"),
+	)
+	defer container.Remove(ctx, t, apiClient, cID, containertypes.RemoveOptions{Force: true})
+
+	res, err := container.Exec(ctx, apiClient, cID, []string{"readlink", "/var/run"})
+	assert.NilError(t, err)
+	assert.Assert(t, is.Equal(strings.TrimSpace(res.Stdout()), "/run"),
+		"the test image no longer ships /var/run as an absolute symlink, so this case is no longer covered")
+
+	const payload = "sealed"
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	assert.NilError(t, tw.WriteHeader(&tar.Header{
+		Name:     "seal-copied",
+		Typeflag: tar.TypeReg,
+		Mode:     0o644,
+		Size:     int64(len(payload)),
+	}))
+	_, err = tw.Write([]byte(payload))
+	assert.NilError(t, err)
+	assert.NilError(t, tw.Close())
+
+	// Opening the container filesystem re-creates the container's mounts inside
+	// the private view, resolving this one's destination through the absolute
+	// symlink. The copy fails outright if that resolution rejects the path.
+	err = apiClient.CopyToContainer(ctx, cID, "/tmp", bytes.NewReader(buf.Bytes()), containertypes.CopyToContainerOptions{})
+	assert.NilError(t, err, "copy into a container whose mount destination resolves through an absolute symlink was rejected")
+
+	res, err = container.Exec(ctx, apiClient, cID, []string{"cat", "/tmp/seal-copied"})
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(res.Stdout(), payload))
+
+	// The mount landed at the symlink target inside the container rather than
+	// at a second /var/run shadowing it, and nothing replaced the symlink.
+	res, err = container.Exec(ctx, apiClient, cID, []string{"sh", "-c", "readlink /var/run; ls -d /run/seal-probe"})
+	assert.NilError(t, err)
+	assert.Check(t, is.Contains(res.Stdout(), "/run/seal-probe"))
+}
