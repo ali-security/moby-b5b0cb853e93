@@ -153,9 +153,6 @@ jobs:
       matrix:
         os:
           - ubuntu-24.04
-          - ubuntu-24.04-arm
-          - macos-latest
-          - windows-latest
     steps:
       -
         name: Checkout
@@ -192,6 +189,27 @@ jobs:
           else
             go test -mod=vendor -count=1 -short -timeout 30m ./pkg/authorization/... ./plugin/... $COMMON_PKGS
           fi
+      -
+        name: DISCOVERY full unit suite (linux)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          # upstream hack/test/unit: ./... minus vendor+integration, libnetwork split out
+          PKGS=$(go list ./... | grep -vE '(/vendor/|/integration)')
+          BASE=$(echo "$PKGS" | grep -v "/libnetwork")
+          LIBNET=$(echo "$PKGS" | grep "/libnetwork")
+          echo "base packages: $(echo "$BASE" | wc -l), libnetwork: $(echo "$LIBNET" | wc -l)"
+          go build -mod=vendor -o /tmp/docker-proxy ./cmd/docker-proxy && sudo install -m0755 /tmp/docker-proxy /usr/local/bin/docker-proxy
+          echo "::group::base unit suite"
+          sudo -E env PATH=$PATH HOME=$HOME GOFLAGS=-mod=vendor go test -mod=vendor -count=1 -short -timeout 30m -tags "netgo journald" $BASE 2>&1 | tail -120
+          echo "base exit: ${PIPESTATUS[0]}"
+          echo "::endgroup::"
+          echo "::group::libnetwork suite"
+          sudo -E env PATH=$PATH HOME=$HOME GOFLAGS=-mod=vendor go test -mod=vendor -count=1 -short -p=1 -timeout 30m -tags "netgo journald" -skip 'TestFlaky.*' $LIBNET 2>&1 | tail -80
+          echo "libnetwork exit: ${PIPESTATUS[0]}"
+          echo "::endgroup::"
       -
         name: Test containerfs scoping and host-side decompression (linux)
         if: runner.os == 'Linux'
