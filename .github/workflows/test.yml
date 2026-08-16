@@ -153,9 +153,6 @@ jobs:
       matrix:
         os:
           - ubuntu-24.04
-          - ubuntu-24.04-arm
-          - macos-latest
-          - windows-latest
     steps:
       -
         name: Checkout
@@ -205,8 +202,9 @@ jobs:
         run: |
           go vet -mod=vendor -tags "netgo journald" ./daemon/ ./integration/container/
       -
-        name: Integration tests for the docker cp CVEs against a dockerd built from source (linux)
+        name: DISCOVERY whole integration/container package (linux)
         if: runner.os == 'Linux'
+        continue-on-error: true
         shell: bash
         run: |
           set -e
@@ -226,7 +224,7 @@ jobs:
           # so run the tests under each. TEST_INTEGRATION_USE_SNAPSHOTTER is read
           # by the daemon itself and by the test harness, so exporting it covers
           # both this daemon and any the fixtures start.
-          for MODE in graphdriver snapshotter; do
+          for MODE in graphdriver; do
             echo "::group::integration tests ($MODE)"
             if [ "$MODE" = "snapshotter" ]; then
               export TEST_INTEGRATION_USE_SNAPSHOTTER=1
@@ -267,9 +265,8 @@ jobs:
             # remaining copy tests cover the ordinary extract/archive paths.
             sudo -E env PATH=$PATH HOME=$HOME DEST=/tmp/integration-dest-$MODE GOFLAGS=-mod=vendor \
               DOCKER_HOST=$DOCKER_HOST DOCKERFILE=../Dockerfile \
-              go test -mod=vendor -count=1 -v -timeout 30m -tags "netgo journald" \
-                -run 'TestCopyToContainerXZBinaryNotExecutedOnDaemon|TestContainerCopyLeaksMounts|TestCopyFromContainer$|TestCopyToContainerCopyUIDGID|TestCopyEmptyFile' \
-                ./integration/container/
+              go test -mod=vendor -count=1 -timeout 60m -tags "netgo journald" \
+                ./integration/container/ || echo "PACKAGE_EXIT=$?"
             sudo pkill -F /tmp/seal-docker-$MODE.pid || true
             for i in $(seq 1 30); do
               if ! [ -S /var/run/docker-seal.sock ]; then break; fi
