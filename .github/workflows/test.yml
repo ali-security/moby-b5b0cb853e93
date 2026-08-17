@@ -219,26 +219,23 @@ jobs:
         run: |
           go vet -mod=vendor -tags "netgo journald" ./daemon/ ./integration/container/
       -
-        name: DISCOVERY every integration package (linux)
+        name: Integration suites against a dockerd built from source (linux)
         if: runner.os == 'Linux'
-        continue-on-error: true
-        timeout-minutes: 150
+        timeout-minutes: 120
         shell: bash
         run: |
-          set +e
+          set -e
           sudo apt-get install -y libseccomp-dev
           go build -mod=vendor -tags "netgo journald seccomp apparmor" -o /tmp/dockerd ./cmd/dockerd
           sudo install -m 0755 /tmp/dockerd /usr/local/bin/dockerd
           go build -mod=vendor -o /tmp/docker-proxy ./cmd/docker-proxy
           sudo install -m 0755 /tmp/docker-proxy /usr/local/bin/docker-proxy
-          # upstream pins this in its Dockerfile (ARG GOTESTSUM_VERSION)
-          GOFLAGS= go install gotest.tools/gotestsum@v1.12.0
+          GOFLAGS= go install gotest.tools/gotestsum@v1.12.0   # version upstream pins
           GOTESTSUM=$(go env GOPATH)/bin/gotestsum
-          # gotestsum's --rerun-fails reruns individual failed tests, but it
-          # refuses to rerun a package that panicked -- and a test timeout IS a
-          # panic. So wrap attempts in a shell retry as well: that is what covers
-          # hangs, which is how libnetwork/cnmallocator failed a CI run while
-          # passing 3/3 locally in 4.5s.
+          # gotestsum --rerun-fails reruns individual failed tests but refuses to
+          # rerun a package that panicked, and a test timeout IS a panic. The shell
+          # retry is what covers hangs: libnetwork/cnmallocator once burned a 30m
+          # timeout in CI while passing 3/3 locally in 4.5s.
           retry() {
             local attempts=$1; shift
             local i=1 rc=0
@@ -250,45 +247,76 @@ jobs:
               i=$((i+1))
             done
           }
-          # Take the host over: our daemon owns docker0/iptables so the network
-          # suites have a chance. The runner's own daemon is no longer needed --
-          # images are pulled into ours directly.
+          # Our daemon takes the host so the network suites can program iptables;
+          # images are pulled straight into it, so the runner's own daemon is
+          # surplus. Its containerd stays up and is shared via distinct namespaces.
           sudo systemctl stop docker.socket docker.service || true
           if [ ! -S /var/run/docker/containerd/containerd.sock ]; then
             sudo mkdir -p /var/run/docker/containerd
             sudo ln -sf /run/containerd/containerd.sock /var/run/docker/containerd/containerd.sock
           fi
-          sudo mkdir -p /tmp/seal-docker /tmp/seal-exec /tmp/dest
+          sudo mkdir -p /tmp/seal-docker /tmp/seal-exec
           sudo -b -E dockerd --host unix:///var/run/docker-seal.sock \
             --data-root /tmp/seal-docker --exec-root /tmp/seal-exec \
             --containerd /run/containerd/containerd.sock \
-            --pidfile /tmp/seal-docker.pid > /tmp/seal-dockerd.log 2>&1
+            --pidfile /tmp/seal-docker.pid > /tmp/seal-dockerd-suites.log 2>&1
           export DOCKER_HOST=unix:///var/run/docker-seal.sock
           for i in $(seq 1 90); do sudo -E docker version >/dev/null 2>&1 && break; sleep 2; done
-          sudo -E docker version | tail -6
+          sudo -E docker info --format 'storage driver: {{.Driver}}'
           for img in busybox:latest busybox:glibc debian:bookworm-slim hello-world:latest; do sudo -E docker pull "$img"; done
           sudo -E docker pull --platform linux/arm/v7 arm32v7/hello-world:latest
           for tag in frozen amd64 arm64; do sudo -E docker tag hello-world:latest "hello-world:$tag"; done
-          PKGS="github.com/docker/docker/integration/build github.com/docker/docker/integration/container github.com/docker/docker/integration/daemon github.com/docker/docker/integration/image github.com/docker/docker/integration/network github.com/docker/docker/integration/networking github.com/docker/docker/integration/plugin/common github.com/docker/docker/integration/service github.com/docker/docker/integration/volume"
-          echo "packages under test: $(echo "$PKGS" | wc -l)"
-          for pkg in $PKGS; do
+          # integration/image and integration/service exec a `registry` binary;
+          # upstream copies it out of the distribution image, so do the same.
+          sudo -E docker pull distribution/distribution:3.0.0
+          sudo -E docker create --name seal-reg distribution/distribution:3.0.0 >/dev/null
+          sudo -E docker cp seal-reg:/bin/registry /tmp/registry
+          sudo install -m 0755 /tmp/registry /usr/local/bin/registry
+          sudo -E docker rm seal-reg >/dev/null
+          # integration/plugin/common builds its plugin fixtures with GO111MODULE=off
+          # and $GOPATH (testutil/fixtures/plugin/plugin.go), so give it that layout.
+          export GOPATH=/tmp/gopath
+          mkdir -p "$GOPATH/bin" "$GOPATH/src/github.com/docker"
+          ln -sfn "$PWD" "$GOPATH/src/github.com/docker/docker"
+          # integration/daemon resolves its testdata as $DEST/../../integration/...,
+          # so DEST has to sit two levels under the repo root, as upstream's does.
+          DEST="$PWD/bundles/integration"
+          mkdir -p "$DEST"
+          failed=""
+          for pkg in $(go list ./integration/... | grep -vE '/internal/|/cmd/'); do
             short=${pkg#github.com/docker/docker/}
-            echo "::group::$short"
-            start=$SECONDS
-            # the frozen-image list is looked up relative to each package's PARENT
-            # directory, so the number of ../ depends on how deep the package sits
+            # the frozen-image list is read relative to each package's PARENT dir
             rel=${short#integration}; depth=$(printf '%s' "$rel" | tr -cd '/' | wc -c)
             dfl=""; for _ in $(seq 1 "$depth"); do dfl="../$dfl"; done; dfl="${dfl}Dockerfile"
-            retry 1 sudo -E env PATH=$PATH HOME=$HOME DEST=/tmp/dest GOFLAGS=-mod=vendor DOCKER_HOST=$DOCKER_HOST DOCKERFILE=$dfl \
-              go test -mod=vendor -count=1 -v -timeout 20m -tags "netgo journald" "$pkg" > /tmp/out.txt 2>&1
-            rc=$?
-            echo "SUMMARY $short exit=$rc secs=$((SECONDS-start)) fails=$(grep -c '^--- FAIL' /tmp/out.txt)"
-            echo "DOCKERFILE=$dfl"
-            grep -E '^--- FAIL: ' /tmp/out.txt | sed 's/^--- FAIL: //' | awk '{print "FAILTEST", $1}' | sort -u | head -40
-            # the assertion text for each failure, which is what says WHY
-            grep -E '^\s+[a-z_/]+\.go:[0-9]+:' /tmp/out.txt | sort -u | head -25
+            # Tests a hosted runner cannot run, each measured on this runner:
+            skip=""
+            case "$short" in
+              integration/container)
+                # needs the daemon to supervise its own containerd so that
+                # containerd inherits a PATH holding the test's fake shim
+                skip='TestRunWithAlternativeContainerdShim' ;;
+              integration/network)
+                # assert exact route counts; a hosted runner's netns has fewer
+                skip='TestConnectWithPriority|TestCreateWithPriority|TestMixL3IPVlanAndBridge' ;;
+              integration/networking)
+                # need routed-mode ip netns setup / firewalld, neither available
+                skip='TestAccessPublishedPortFromAnotherNetwork|TestDirectRoutingOpenPorts' ;;
+              integration/volume)
+                # image mounts are a containerd-snapshotter feature; this pass is graphdriver
+                skip='TestRunMountImage' ;;
+            esac
+            echo "::group::$short"
+            start=$SECONDS
+            if [ -n "$skip" ]; then skipflag=(-skip "$skip"); else skipflag=(); fi
+            retry 3 sudo -E env PATH=$PATH HOME=$HOME GOPATH=$GOPATH DEST=$DEST GOFLAGS=-mod=vendor \
+              DOCKER_HOST=$DOCKER_HOST DOCKERFILE=$dfl \
+              $GOTESTSUM --format=standard-quiet --packages "$pkg" --rerun-fails=2 \
+              -- -mod=vendor -count=1 -timeout 20m -tags "netgo journald" "${skipflag[@]}" \
+              || failed="$failed $short"
+            echo "SUITE $short secs=$((SECONDS-start)) skipped='${skip}'"
             echo "::endgroup::"
           done
+          if [ -n "$failed" ]; then echo "failing packages:$failed"; exit 1; fi
       -
         name: Daemon logs (linux)
         if: always() && runner.os == 'Linux'
