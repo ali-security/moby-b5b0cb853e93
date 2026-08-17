@@ -275,12 +275,16 @@ jobs:
             short=${pkg#github.com/docker/docker/}
             echo "::group::$short"
             start=$SECONDS
-            retry 1 sudo -E env PATH=$PATH HOME=$HOME DEST=/tmp/dest GOFLAGS=-mod=vendor DOCKER_HOST=$DOCKER_HOST \
-              $GOTESTSUM --format=standard-quiet --packages "$pkg" --rerun-fails=2 \
-              -- -mod=vendor -count=1 -timeout 20m -tags "netgo journald" > /tmp/out.txt 2>&1
+            # the frozen-image list is looked up relative to each package's PARENT
+            # directory, so the number of ../ depends on how deep the package sits
+            rel=${short#integration}; depth=$(printf '%s' "$rel" | tr -cd '/' | wc -c)
+            dfl=""; for _ in $(seq 1 "$depth"); do dfl="../$dfl"; done; dfl="${dfl}Dockerfile"
+            retry 1 sudo -E env PATH=$PATH HOME=$HOME DEST=/tmp/dest GOFLAGS=-mod=vendor DOCKER_HOST=$DOCKER_HOST DOCKERFILE=$dfl \
+              go test -mod=vendor -count=1 -v -timeout 20m -tags "netgo journald" "$pkg" > /tmp/out.txt 2>&1
             rc=$?
             echo "SUMMARY $short exit=$rc secs=$((SECONDS-start)) fails=$(grep -c '^--- FAIL' /tmp/out.txt)"
-            grep -E '^(=== FAIL|=== RERUN|DONE)' /tmp/out.txt | head -40
+            echo "DOCKERFILE=$dfl"
+            grep -E '^--- FAIL: ' /tmp/out.txt | sed 's/^--- FAIL: //' | awk '{print "FAILTEST", $1}' | sort -u | head -40
             # the assertion text for each failure, which is what says WHY
             grep -E '^\s+[a-z_/]+\.go:[0-9]+:' /tmp/out.txt | sort -u | head -25
             echo "::endgroup::"
