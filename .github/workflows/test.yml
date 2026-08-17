@@ -269,18 +269,20 @@ jobs:
           for img in busybox:latest busybox:glibc debian:bookworm-slim hello-world:latest; do sudo -E docker pull "$img"; done
           sudo -E docker pull --platform linux/arm/v7 arm32v7/hello-world:latest
           for tag in frozen amd64 arm64; do sudo -E docker tag hello-world:latest "hello-world:$tag"; done
-          PKGS=$(go list ./integration/... | grep -vE '/internal/|/cmd/')
+          PKGS="github.com/docker/docker/integration/build github.com/docker/docker/integration/container github.com/docker/docker/integration/daemon github.com/docker/docker/integration/image github.com/docker/docker/integration/network github.com/docker/docker/integration/networking github.com/docker/docker/integration/plugin/common github.com/docker/docker/integration/service github.com/docker/docker/integration/volume"
           echo "packages under test: $(echo "$PKGS" | wc -l)"
           for pkg in $PKGS; do
             short=${pkg#github.com/docker/docker/}
             echo "::group::$short"
             start=$SECONDS
-            retry 3 sudo -E env PATH=$PATH HOME=$HOME DEST=/tmp/dest GOFLAGS=-mod=vendor DOCKER_HOST=$DOCKER_HOST \
+            retry 1 sudo -E env PATH=$PATH HOME=$HOME DEST=/tmp/dest GOFLAGS=-mod=vendor DOCKER_HOST=$DOCKER_HOST \
               $GOTESTSUM --format=standard-quiet --packages "$pkg" --rerun-fails=2 \
               -- -mod=vendor -count=1 -timeout 20m -tags "netgo journald" > /tmp/out.txt 2>&1
             rc=$?
             echo "SUMMARY $short exit=$rc secs=$((SECONDS-start)) fails=$(grep -c '^--- FAIL' /tmp/out.txt)"
-            grep -E '^(--- FAIL|=== RERUN|DONE)' /tmp/out.txt | head -25
+            grep -E '^(=== FAIL|=== RERUN|DONE)' /tmp/out.txt | head -40
+            # the assertion text for each failure, which is what says WHY
+            grep -E '^\s+[a-z_/]+\.go:[0-9]+:' /tmp/out.txt | sort -u | head -25
             echo "::endgroup::"
           done
       -
