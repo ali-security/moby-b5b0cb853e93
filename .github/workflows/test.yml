@@ -288,6 +288,11 @@ jobs:
           # so DEST has to sit two levels under the repo root, as upstream's does.
           DEST="$PWD/bundles/integration"
           mkdir -p "$DEST"
+          # The userns-remap daemons run as a remapped root (uid 231072) and need
+          # traverse permission on every directory above their data-root, which
+          # has to sit under the repo for the daemon-config tests above. The
+          # runner's home is not world-traversable, so grant o+x up the chain.
+          d="$DEST"; while [ "$d" != "/" ]; do sudo chmod o+x "$d" 2>/dev/null || true; d=$(dirname "$d"); done
           failed=""
           for pkg in $(go list ./integration/... | grep -vE '/internal/|/cmd/'); do
             short=${pkg#github.com/docker/docker/}
