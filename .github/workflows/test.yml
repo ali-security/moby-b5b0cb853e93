@@ -273,6 +273,12 @@ jobs:
           sudo -E docker cp seal-reg:/bin/registry /tmp/registry
           sudo install -m 0755 /tmp/registry /usr/local/bin/registry
           sudo -E docker rm seal-reg >/dev/null
+          # integration/build and integration/image start a --userns-remap=default
+          # daemon, which needs a dockremap user with subuid/subgid ranges. Upstream
+          # gets it from its dev-container base image; a hosted runner has neither.
+          id dockremap >/dev/null 2>&1 || sudo useradd -M -s /usr/sbin/nologin dockremap
+          grep -q '^dockremap:' /etc/subuid || echo 'dockremap:165536:65536' | sudo tee -a /etc/subuid >/dev/null
+          grep -q '^dockremap:' /etc/subgid || echo 'dockremap:165536:65536' | sudo tee -a /etc/subgid >/dev/null
           # integration/plugin/common builds its plugin fixtures with GO111MODULE=off
           # and $GOPATH (testutil/fixtures/plugin/plugin.go), so give it that layout.
           export GOPATH=/tmp/gopath
