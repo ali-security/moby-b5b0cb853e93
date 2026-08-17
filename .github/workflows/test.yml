@@ -147,12 +147,15 @@ jobs:
 
   seal-test:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 180
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         os:
           - ubuntu-24.04
+          - ubuntu-24.04-arm
+          - macos-latest
+          - windows-latest
     steps:
       -
         name: Checkout
@@ -195,7 +198,6 @@ jobs:
       -
         name: Test libnetwork suite (linux)
         if: runner.os == 'Linux'
-        continue-on-error: true
         shell: bash
         run: |
           # libnetwork's bridge tests exec docker-proxy, as upstream's hack/test/unit does
@@ -218,6 +220,109 @@ jobs:
         shell: bash
         run: |
           go vet -mod=vendor -tags "netgo journald" ./daemon/ ./integration/container/
+      -
+        name: Integration tests for the docker cp CVEs against a dockerd built from source (linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -e
+          sudo apt-get install -y libseccomp-dev
+          go build -mod=vendor -tags "netgo journald seccomp apparmor" -o /tmp/dockerd ./cmd/dockerd
+          sudo install -m 0755 /tmp/dockerd /usr/local/bin/dockerd
+          # Tests that start their own daemon go through testutil/daemon, which
+          # always passes --containerd /var/run/docker/containerd/containerd.sock
+          # (the moby dev-container path); point it at the runner's containerd.
+          # Each such daemon uses its own containerd namespace.
+          if [ ! -S /var/run/docker/containerd/containerd.sock ]; then
+            sudo mkdir -p /var/run/docker/containerd
+            sudo ln -sf /run/containerd/containerd.sock /var/run/docker/containerd/containerd.sock
+          fi
+          # Upstream matrixes its integration suite over both storage modes
+          # (.github/workflows/test.yml: storage = graphdriver | snapshotter),
+          # so run the tests under each. TEST_INTEGRATION_USE_SNAPSHOTTER is read
+          # by the daemon itself and by the test harness, so exporting it covers
+          # both this daemon and any the fixtures start.
+          # Same host takeover as the suites step below: our daemon owns
+          # docker0/iptables so NAT and name-resolution tests work here too.
+          # With --iptables=false, TestNetworkLocalhostTCPNat and
+          # TestRenameAnonymousContainer were environment-dependent.
+          sudo systemctl stop docker.socket docker.service || true
+          # gotestsum --rerun-fails cannot rerun a panicking package (a test
+          # timeout IS a panic), so retry the whole invocation as well.
+          retry() {
+            local attempts=$1; shift
+            local i=1 rc=0
+            while true; do
+              "$@" && return 0
+              rc=$?
+              [ $i -ge $attempts ] && { echo "still failing after $attempts attempts (exit $rc)"; return $rc; }
+              echo "attempt $i failed (exit $rc); retrying"
+              i=$((i+1))
+            done
+          }
+          for MODE in graphdriver snapshotter; do
+            echo "::group::integration tests ($MODE)"
+            if [ "$MODE" = "snapshotter" ]; then
+              export TEST_INTEGRATION_USE_SNAPSHOTTER=1
+            else
+              unset TEST_INTEGRATION_USE_SNAPSHOTTER || true
+            fi
+            # Run against a daemon built from THIS tree, not the runner's
+            # pre-installed one: the tests that reuse testEnv's daemon (rather
+            # than starting their own) would otherwise exercise stock docker.
+            sudo mkdir -p /tmp/seal-docker-$MODE /tmp/seal-exec-$MODE /tmp/integration-dest-$MODE
+            sudo -b -E dockerd --host unix:///var/run/docker-seal.sock \
+              --data-root /tmp/seal-docker-$MODE --exec-root /tmp/seal-exec-$MODE \
+              --containerd /run/containerd/containerd.sock \
+              --pidfile /tmp/seal-docker-$MODE.pid \
+              > /tmp/seal-dockerd-$MODE.log 2>&1
+            export DOCKER_HOST=unix:///var/run/docker-seal.sock
+            for i in $(seq 1 60); do
+              if sudo -E docker version > /dev/null 2>&1; then break; fi
+              sleep 2
+            done
+            sudo -E docker version
+            sudo -E docker info --format 'storage driver: {{.Driver}}'
+            # The fixture's TestMain requires the whole frozen-image set on the
+            # daemon under test, and its fallback pulls the year-old digests
+            # pinned in the repo Dockerfile. Pre-populate instead; only busybox
+            # is used by these tests, so the hello-world tags are local aliases.
+            for img in busybox:latest busybox:glibc debian:bookworm-slim hello-world:latest; do
+              sudo -E docker pull "$img"
+            done
+            # TestCreatePlatformSpecificImageNoPlatform needs this one, and it is published
+            # for arm/v7 only, so the platform has to be explicit or the pull resolves to
+            # the host platform and fails.
+            sudo -E docker pull --platform linux/arm/v7 arm32v7/hello-world:latest
+            for tag in frozen amd64 arm64; do
+              sudo -E docker tag hello-world:latest "hello-world:$tag"
+            done
+            # TestCopyToContainerXZBinaryNotExecutedOnDaemon is upstream's
+            # regression test for CVE-2026-41567. TestContainerCopyLeaksMounts
+            # drives a cp through openContainerFS with a real rslave bind mount,
+            # which is the mount wiring CVE-2026-42306 and CVE-2026-41568 change,
+            # and asserts the container's mountinfo is untouched afterwards. The
+            # remaining copy tests cover the ordinary extract/archive paths.
+            retry 3 sudo -E env PATH=$PATH HOME=$HOME DEST=/tmp/integration-dest-$MODE GOFLAGS=-mod=vendor \
+              DOCKER_HOST=$DOCKER_HOST DOCKERFILE=../Dockerfile \
+              go test -mod=vendor -count=1 -timeout 60m -tags "netgo journald" \
+                -skip 'TestRunWithAlternativeContainerdShim' \
+                ./integration/container/
+              # The package run above is quiet; re-run just the CVE cases verbosely so
+              # the per-test evidence is legible in the log this build ships.
+              sudo -E env PATH=$PATH HOME=$HOME DEST=/tmp/integration-dest-$MODE GOFLAGS=-mod=vendor \
+                DOCKER_HOST=$DOCKER_HOST DOCKERFILE=../Dockerfile \
+                go test -mod=vendor -count=1 -v -timeout 10m -tags "netgo journald" \
+                -run 'TestCopyToContainerXZBinaryNotExecutedOnDaemon|TestContainerCopyLeaksMounts|TestCopyToContainerWithAbsoluteSymlinkedMountPath' \
+                ./integration/container/
+            sudo pkill -F /tmp/seal-docker-$MODE.pid || true
+            for i in $(seq 1 30); do
+              if ! [ -S /var/run/docker-seal.sock ]; then break; fi
+              sudo rm -f /var/run/docker-seal.sock 2>/dev/null || true
+              sleep 1
+            done
+            echo "::endgroup::"
+          done
       -
         name: Integration suites against a dockerd built from source (linux)
         if: runner.os == 'Linux'
